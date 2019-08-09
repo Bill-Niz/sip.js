@@ -6,7 +6,7 @@ var dgram = require('dgram');
 var tls = require('tls');
 var os = require('os');
 var crypto = require('crypto');
-var WebSocket = require('ws');
+var WebSocket = require('uws');
 
 function debug(e) {
   if(e.stack) {
@@ -27,7 +27,7 @@ function toBase64(s) {
   default:
   }
 
-  return (new Buffer.from(s)).toString('base64').replace(/\//g, '_').replace(/\+/g, '-');
+  return (new Buffer(s)).toString('base64').replace(/\//g, '_').replace(/\+/g, '-');
 }
 // Actual stack code begins here
 
@@ -93,7 +93,7 @@ function parseGenericHeader(d, h) {
 }
 
 function parseAOR(data) {
-  var r = applyRegex(/((?:[\w\-.!%*_+`'~]+)(?:\s+[\w\-.!%*_+`'~]+)*|"[^"\\]*(?:\\.[^"\\]*)*")?\s*\<\s*([^>]*)\s*\>|((?:[^\s@"<]@)?[^\s;]+)/g, data);
+  var r = applyRegex(/((?:[\w\-.!%*_+`'~]+)(?:\s+[\w\-.!%*_+`'~]+)*|"[^"\\]*(?:\\.[^"\\]*)*")?\s*\<\s*((?:[^">]|(?:"[^"]*"))*)\s*\>|((?:[^\s@"<]@)?[^\s;]+)/g, data);
 
   return parseParams(data, {name: r[1], uri: r[2] || r[3] || ''});
 }
@@ -358,7 +358,7 @@ function stringify(m) {
     s = m.method + ' ' + stringifyUri(m.uri) + ' SIP/' + stringifyVersion(m.version) + '\r\n';
   }
 
-  m.headers['content-length'] = (m.content || '').length;
+  m.headers['content-length'] = Buffer.byteLength(m.content || '', "utf8");
 
   for(var n in m.headers) {
     if(typeof m.headers[n] !== "undefined") {
@@ -435,28 +435,12 @@ function defaultPort(proto) {
   return proto.toUpperCase() === 'TLS' ? 5061 : 5060;
 }
 
-function makeStreamParser(onMessage, onFlood, maxBytesHeaders, maxContentLength) {
-
-  onFlood= onFlood || function(){};
-  maxBytesHeaders= maxBytesHeaders || 60480;
-  maxContentLength= maxContentLength || 604800;
-
+function makeStreamParser(onMessage) {
   var m;
   var r = '';
   
   function headers(data) {
-    r += data;
-
-    if( r.length > maxBytesHeaders ){
-
-      r = '';
-
-      onFlood();
-
-      return;
-
-    }
-
+    r += data.toString("utf8");
     var a = r.match(/^\s*([\S\s]*?)\r\n\r\n([\S\s]*)$/);
 
     if(a) {
@@ -464,32 +448,22 @@ function makeStreamParser(onMessage, onFlood, maxBytesHeaders, maxContentLength)
       m = parse(a[1]);
 
       if(m && m.headers['content-length'] !== undefined) {
-
-        if (m.headers['content-length'] > maxContentLength) {
-
-          r = '';
-
-          onFlood();
-
-        }
-
         state = content;
         content('');
       }
-      else
-        headers('');
     }
   }
 
   function content(data) {
-    r += data;
+    r += data.toString("utf8");
 
-    if(r.length >= m.headers['content-length']) {
-      m.content = r.substring(0, m.headers['content-length']);
-      
+    if( Buffer.byteLength(r,"utf8") >= m.headers['content-length']) {
+      var buffer= new Buffer(r, "utf8");
+      m.content = buffer.slice(0, m.headers['content-length']).toString("utf8");
+      var s = buffer.slice(m.headers['content-length']);
+
       onMessage(m);
       
-      var s = r.substring(m.headers['content-length']);
       state = headers;
       r = '';
       headers(s);
@@ -499,19 +473,18 @@ function makeStreamParser(onMessage, onFlood, maxBytesHeaders, maxContentLength)
   var state=headers;
 
   return function(data) { state(data); }
-
 }
 exports.makeStreamParser = makeStreamParser;
 
 function parseMessage(s) {
-  var r = s.toString('binary').match(/^\s*([\S\s]*?)\r\n\r\n([\S\s]*)$/);
+  var r = s.toString('utf8').match(/^\s*([\S\s]*?)\r\n\r\n([\S\s]*)$/);
   if(r) {
     var m = parse(r[1]);
 
     if(m) {
       if(m.headers['content-length']) {
-        var c = Math.max(0, Math.min(m.headers['content-length'], r[2].length));
-        m.content = r[2].substring(0, c);
+        var c = Math.max(0, Math.min(m.headers['content-length'], Buffer.byteLength(r[2], "utf8")));
+        m.content = (new Buffer(r[2], "utf8")).slice(0,c).toString("utf8");
       }
       else {
         m.content = r[2];
@@ -534,7 +507,7 @@ function checkMessage(msg) {
     msg.headers.cseq;
 }
 
-function makeStreamTransport(protocol, maxBytesHeaders, maxContentLength, connect, createServer, callback) {
+function makeStreamTransport(protocol, connect, createServer, callback) {
   var remotes = Object.create(null);
   var flows = Object.create(null);
 
@@ -548,27 +521,15 @@ function makeStreamTransport(protocol, maxBytesHeaders, maxContentLength, connec
       flows[flowid] = remotes[remoteid];
     }
 
-    var onMessage= function(m) {
-
+    stream.setEncoding('utf8');
+    stream.on('data', makeStreamParser(function(m) {
       if(checkMessage(m)) {
         if(m.method) m.headers.via[0].params.received = remote.address;
         callback(m,
           {protocol: remote.protocol, address: stream.remoteAddress, port: stream.remotePort, local: { address: stream.localAddress, port: stream.localPort}},
           stream);
       }
-
-    };
-
-    var onFlood= function() {
-
-      console.log("Flood attempt, destroying stream");
-
-      stream.destroy();
-
-    };
-
-    stream.setEncoding('binary');
-    stream.on('data', makeStreamParser( onMessage, onFlood, maxBytesHeaders, maxContentLength));
+    }));
   
     stream.on('close',    function() {
       if(flowid) delete flows[flowid]; 
@@ -596,7 +557,7 @@ function makeStreamTransport(protocol, maxBytesHeaders, maxContentLength, connec
           if(--refs === 0) stream.emit('no_reference');
         },
         send: function(m) {
-          stream.write(stringify(m), 'binary');
+          stream.write(stringify(m), 'utf8');
         },
         protocol: protocol
       }
@@ -632,8 +593,6 @@ function makeStreamTransport(protocol, maxBytesHeaders, maxContentLength, connec
 function makeTlsTransport(options, callback) {
   return makeStreamTransport(
     'TLS', 
-    options.maxBytesHeaders,
-    options.maxContentLength,
     function(port, host, callback) { return tls.connect(port, host, options.tls, callback); }, 
     function(callback) {
       var server = tls.createServer(options.tls, callback);
@@ -646,8 +605,6 @@ function makeTlsTransport(options, callback) {
 function makeTcpTransport(options, callback) {
   return makeStreamTransport(
     'TCP',
-    options.maxBytesHeaders,
-    options.maxContentLength,
     function(port, host, callback) { return net.connect(port, host, callback); },
     function(callback) { 
       var server = net.createServer(callback);
@@ -686,7 +643,7 @@ function makeWsTransport(options, callback) {
         refs = 0;
     
     function send_connecting(m) { queue.push(stringify(m)); }
-    function send_open(m) { socket.send(new Buffer.from(typeof m === 'string' ? m : stringify(m), 'binary')); }
+    function send_open(m) { socket.send(typeof m === 'string' ? m : stringify(m)); }
     var send = send_connecting;
 
     socket.on('open', function() { 
@@ -783,7 +740,7 @@ function makeUdpTransport(options, callback) {
     return {
       send: function(m) {
         var s = stringify(m);
-        socket.send(new Buffer.from(s, 'binary'), 0, s.length, remote.port, remote.address);          
+        socket.send(new Buffer(s, 'utf8'), 0, s.length, remote.port, remote.address);          
       },
       protocol: 'UDP',
       release : function() {}
@@ -1358,7 +1315,7 @@ exports.create = function(options, callback) {
   }
 
   function decodeFlowToken(token) {
-    var s = (new Buffer.from(token, 'base64')).toString('ascii').split(',');
+    var s = (new Buffer(token, 'base64')).toString('utf8').split(',');
     if(s.length != 6) return;
 
     var flow = {protocol: s[1], address: s[2], port: +s[3], local: {address: s[4], port: +s[5]}};
@@ -1454,4 +1411,3 @@ exports.start = function(options, callback) {
   exports.isFlowUri = r.isFlowUri;
   exports.hostname = r.hostname;
 }
-
